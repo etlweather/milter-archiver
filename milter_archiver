@@ -1,0 +1,389 @@
+#!/usr/bin/perl
+#
+# A milter archiver that adds extra SMTP debug info in the mail, and 
+# BCC's it to one of the specified addresses.
+#
+# Author  : paulv@bikkel.org / paulv@dds.nl 
+# Licence : public domain
+#
+# BUGS    : none known 
+#
+# Format of the archive file: 
+# <regex> <whitespace> <target_mail_adress>  
+# 
+# example:
+#
+# \@example.test archiver@example.test
+#
+# 
+
+# apt-get install libsendmail-pmilter-perl
+use Sendmail::PMilter ':all';
+
+# apt-get install libsendmail-milter-perl
+# don't forget to comment out some code below if you use Sendmail::Milter
+# use Sendmail::Milter ':all';
+
+# apt-get install libmail-imapclient-perl
+use Mail::IMAPClient;
+
+use Net::SMTP;
+
+use Getopt::Long;
+use Socket;
+
+my $DEBUG      = 0;
+
+my $milterid   = 'archiver';
+my $backlog    = 0;
+my $children   = 100;
+my $maxreq     = 100; 
+my $imapserver = 'localhost'; 
+my $imapuser   = '*vmail'; # if you use dovecot masteruser feature 
+my $imapbox    = 'INBOX'; 
+my $imappw     = '/etc/postfix/imapsecret'; # passwd on a single line 
+my $imapmaster = 1; 
+my $useimap    = 1; 
+my $usesendmail= 0; 
+my $usemilter  = 0; 
+my $usesmtp    = 0; 
+my $smtpserver = 'localhost; 
+my $postmaster = 'root@localhost'; 
+my $sendmail   = "/usr/sbin/sendmail -G -i -f "; # sendmail / postfix inject command
+my $h_srcip    = "X-Archive-src-IPv4";
+my $h_dstip    = "X-Archive-dst-IPv4";
+my $h_from     = "X-Archive-MAIL-FROM";
+my $h_to       = "X-Archive-RCPT-TO";
+my $h_end      = "X-Archive-end";
+
+my $bogusip    = '255.255.255.255'; # what we set the ip to if the client ip is unknown
+
+my $socket     = "unix:/var/run/$milterid.sock";
+my $regexfile  = '/etc/postfix/archive'; 
+
+my %snoop      = {};
+my $unix_socket; 
+
+
+GetOptions (
+		"backlog=i"    => \$backlog, 
+		"children=i"   => \$children, 
+		"maxreq=i"     => \$maxreq, 
+                "socket=s"     => \$socket,
+                "imapserver=s" => \$imapserver,
+                "imapuser=s"   => \$imapuser,
+                "imapmaster"   => \$imapmaster,
+                "imappw=s"     => \$imappw,
+                "imapbox=s"    => \$imapbox,
+                "bogusip=s"    => \$bogusip,
+                "useimap"      => \$useimap,
+                "usemilter"    => \$usemilter,
+                "usesmtp"      => \$usesmtp,
+                "usesendmail"  => \$usesendmail,
+                "smtpserver=s" => \$smtpserver,
+                "regexfile=s"  => \$regexfile,
+                "debug=i"      => \$DEBUG
+);
+
+errorlog("debug level = $DEBUG") if $DEBUG;
+
+if ($socket =~ /^unix:(.+)$/) {
+
+	$unix_socket = $1;
+	if (-e $unix_socket) { die "unlinking failed: " . $! unless unlink($unix_socket) }
+
+} elsif ($socket =~ /^inet:(.+)$/) {
+
+	$unix_socket = $1;
+
+} else { 
+
+	die "Usage: $0 --socket=<unix:/path/to/unix/socket> --regexfile=</etc/postfix/path/to/archive/regex_file> " 
+}
+    
+
+open (PT,$regexfile) or die $!;
+while(<PT> ) { 
+	chomp;
+	next if /^#/;
+
+	@_ = split(); 
+	$_[0] =~ s/^\///;
+	$_[0] =~ s/\/$//;
+	$snoop{$_[0]} = $_[1];  
+	errorlog("adding addres patern: " . $_[0] . " => " . $_[1]) if $DEBUG;
+}
+close PT;
+
+my %callbacks = (
+
+	'connect' =>	\&connect_callback,
+	'envfrom' =>	\&envfrom_callback,
+	'envrcpt' =>	\&envrcpt_callback,
+	'eoh'     =>	\&eoh_callback,
+	'eom'     =>	\&eom_callback,
+	'body'    =>	\&body_callback,
+	'header' =>     \&header_callback,
+	'abort'   =>	\&abort_callback,
+	'close'   =>	\&close_callback,
+);
+
+# Sendmail::PMilter
+# $ENV{PMILTER_DISPATCHER} = 'prefork';
+ my $milter   = new Sendmail::PMilter;
+ die "Failed to set connection: " . $!				unless $milter->setconn($socket);
+ if ( $backlog > 0 ) { die "Failed to set backlog: " . $!	unless $milter->set_listen($backlog) }
+ die "Failed to register callbacks " . $!			unless $milter->register($milterid, \%callbacks, SMFI_CURR_ACTS);
+ die "we could not exit from Sendmail::PMilter::main()" . $!	unless $milter->main($children,$maxreq);
+
+# Sendmail::Milter 
+# die "Failed to set connection: " . $!				unless Sendmail::Milter::setconn($socket);
+# die "Failed to register callbacks " . $!			unless Sendmail::Milter::register($milterid, \%callbacks, SMFI_CURR_ACTS);
+# die "we could not exit from Sendmail::Milter::main()" . $!	unless Sendmail::Milter::main($children,$maxreq);
+
+
+
+sub connect_callback : locked {
+
+    my $hash     = {} ;
+    my $ctx      = shift;
+    my $hostname = shift;
+    my $sockaddr = shift;
+    my $ipex     = '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}';
+
+    # some milter macro's are sometimes not there? weird stuff..  
+    # you might try setting this in postfix: 
+    # milter_connect_macros = j {client_addr} _ {if_addr} 
+    if    ( $_ = $ctx->getsymval('{client_addr}') and /$ipex/ ) { $hash{'srcip'} = $_ } 
+    elsif ( $_ = $ctx->getsymval('_') and /\[($ipex)\]/ )       { $hash{'srcip'} = $1 } 
+    else  { $hash{'srcip'} = $bogusip } 
+
+    if    ( $_ = $ctx->getsymval('{if_addr}') and /$ipex/ )     { $hash{'dstip'} = $_ } 
+    elsif ( ( (undef,$_) = sockaddr_in($sockaddr) and $_ = inet_ntoa($_)) and /$ipex/ ) { $hash{'dstip'} = $_ } 
+    else  { $hash{'dstip'} = $bogusip } 
+
+    errorlog("dstip = " . $hash{'dstip'} . ", srcip = " . $hash{'srcip'}) if $DEBUG > 3;
+
+    $ctx->setpriv($hash);
+
+    return SMFIS_CONTINUE;
+}
+
+sub envfrom_callback : locked {
+
+    my $ctx  = shift;
+    my $hash = $ctx->getpriv();
+
+    $hash{'from'} = shift;
+    $hash{'header'} = '';
+
+    errorlog("from = " . $hash{'from'}) if $DEBUG > 3;
+
+    $ctx->setpriv($hash);
+
+    return SMFIS_CONTINUE;
+}
+
+sub envrcpt_callback : locked {
+
+    my $ctx   = shift;
+    my $to    = shift;
+    my $hash  = $ctx->getpriv();
+    my @rcpts = ();
+
+    errorlog("to = " . $to) if $DEBUG > 3;
+
+    if (defined $hash{'rcpts'}) {
+	@rcpts = @{$hash{'rcpts'}};
+    }
+
+    push @rcpts,$to;
+    $hash{'rcpts'} = \@rcpts;
+    $ctx->setpriv($hash);
+
+    return SMFIS_CONTINUE;
+}
+
+sub eoh_callback : locked {
+
+    my $ctx     = shift;
+    my $hash    = $ctx->getpriv();
+    my @tocheck = @{$hash{'rcpts'}};  
+    my $found   = 0;
+
+    push @tocheck,$hash{'from'}; 
+
+    errorlog("checking to see if we should archive") if $DEBUG > 3;
+
+    foreach ( @tocheck ) { 
+
+    	s/^\<//; s/\>$//;
+	foreach my $key (keys %snoop) { 
+		if ( m/$key/ ) { 
+			$found = 1; 
+                	$hash{'archive'} = $snoop{$key};
+		} 
+	}
+    }
+
+    if( $found ) { 
+
+    	errorlog("archiving mail to = " . $hash{'archive'}) if $DEBUG > 3;
+	my $extra_headers;
+
+	if ( $usemilter) { 
+
+		$ctx->addheader( $h_srcip, $hash{'srcip'} );
+		$ctx->addheader( $h_dstip, $hash{'dstip'} );
+		$ctx->addheader( $h_from,  $hash{'from'}  );
+		foreach ( @{$hash{'rcpts'}} ) { 
+			$ctx->addheader( $h_to, $_) 
+		} 
+		$ctx->addheader( $h_end, '' );
+	}
+
+	if ( $usesendmail or $useimap or $usesmtp ) { 
+
+		$extra_headers .= $h_srcip . ":" . $hash{'srcip'} . "\n";
+		$extra_headers .= $h_dstip . ":" . $hash{'dstip'} . "\n"; 
+		$extra_headers .= $h_from  . ":" . $hash{'from'}  . "\n"; 
+		foreach ( @{$hash{'rcpts'}} ) { 
+			$extra_headers .= $h_to . ":" . $_ . "\n" 
+		}
+		$extra_headers .= $h_end . ":\n";
+	}
+	
+        $hash{'found'} = $found;
+        $hash{'body'}  = '';
+        $hash{'extra_headers'} = $extra_headers;
+
+        $ctx->setpriv($hash);
+
+    } 
+	
+    return SMFIS_CONTINUE;
+}
+
+sub body_callback : locked { 
+
+    my $ctx  = shift;
+    my $hash = $ctx->getpriv();
+
+    return SMFIS_CONTINUE if $hash{'found'} == 0;
+    errorlog("in body callback") if $DEBUG > 3;
+
+    $hash{'body'} .= shift;
+
+    $ctx->setpriv($hash);
+
+    return SMFIS_CONTINUE;
+}
+
+sub header_callback : locked { 
+
+    my $ctx  = shift;
+    my $hash = $ctx->getpriv();
+
+    return SMFIS_CONTINUE if $hash{'found'} == 0;
+    errorlog("in header callback") if $DEBUG > 3;
+
+    $hash{'header'} .= $_[0] . ':' . $_[1] . "\n";
+
+    $ctx->setpriv($hash);
+
+    return SMFIS_CONTINUE;
+}
+
+sub eom_callback : locked { 
+
+    my $ctx     = shift;
+    my $hash    = $ctx->getpriv();
+
+    return SMFIS_CONTINUE if $hash{'found'} == 0;
+    errorlog("in eom callback") if $DEBUG > 3;
+
+    my $msg = $hash{'extra_headers'} . $hash{'header'} . $hash{'body'};
+    errorlog($msg) if $DEBUG > 3;
+
+    if ( $useimap ) { 
+
+	$imapuser = $hash{'archive'} . $imapuser if $imapmaster; 
+	my $pw = cat($imappw);
+	chomp($pw);
+        errorlog("trying to archive in imap://$imapuser\@$imapserver:$imapbox") if $DEBUG > 3;
+		
+    	if ( my $imap = Mail::IMAPClient->new( 
+			Server => $imapserver, 
+			User => $imapuser, 
+			Password => $pw ) ) { 
+
+		$imap->Debug(1) if $DEBUG > 3;
+		$imap->select($imapbox) or return SMFIS_TEMPFAIL;
+		$imap->append_string( $imapbox, $msg, 'NEW') or return SMFIS_TEMPFAIL; 
+		$imap->logout;
+		
+    	} else { 
+		errorlog("Could not login to imap://$imapuser\@$imapserver");
+		return SMFIS_TEMPFAIL;
+    	} 
+
+    } 
+
+    if ( $usesendmail ) {  
+
+        errorlog("trying to archive using sendmail inject $sendmail $postmaster $hash{'archive'}") if $DEBUG > 3;
+	open (MAIL_INJECT," | $sendmail $postmaster $hash{'archive'}" ) or return SMFIS_TEMPFAIL;
+	print MAIL_INJECT $msg or return SMFIS_TEMPFAIL;
+	close(MAIL_INJECT);
+
+    } 
+
+    if ( $usemilter) {  
+        errorlog("adding rcpt $hash{'archive'} to message") if $DEBUG > 3;
+	$ctx->addrcpt($hash{'archive'}) or return SMFIS_TEMPFAIL;
+    } 
+
+    if ( $usesmtp) {  
+        errorlog("trying to deliver using smtp to $smtpserver ") if $DEBUG > 3;
+	my $smtp = Net::SMTP->new($smtpserver) or return SMFIS_TEMPFAIL;
+	$smtp->mail( $postmaster )    or return SMFIS_TEMPFAIL;
+        $smtp->to( $hash{'archive'} ) or return SMFIS_TEMPFAIL;
+        $smtp->data()                 or return SMFIS_TEMPFAIL;
+        $smtp->datasend($msg)         or return SMFIS_TEMPFAIL;
+        $smtp->dataend()              or return SMFIS_TEMPFAIL;
+        $smtp->quit;
+    } 
+
+    return SMFIS_CONTINUE;
+}
+
+sub abort_callback {
+
+    my $ctx = shift;
+    $ctx->setpriv(undef);
+
+    return SMFIS_CONTINUE;
+}
+
+sub close_callback {
+
+    my $ctx = shift;
+    $ctx->setpriv(undef);
+
+    return SMFIS_CONTINUE;
+}
+
+## support functions  
+
+sub cat { 
+	open (FILE,$_[0] ) || die $_[0] . $!;
+	$_ = <FILE>;
+	close FILE; 
+	return $_;
+}
+
+sub errorlog { 
+	# feel free to add syslog support here. 
+	print STDERR "DEBUG: " . $_[0] . "\n" 
+}
+
